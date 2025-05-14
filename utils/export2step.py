@@ -4,14 +4,14 @@ import json
 import h5py
 import numpy as np
 from OCC.Core.BRepCheck import BRepCheck_Analyzer
-from OCC.Extend.DataExchange import read_step_file, write_step_file
+from OCC.Extend.DataExchange import read_step_file, write_step_file, write_ply_file
 import argparse
 import sys
+
 sys.path.append("..")
 from cadlib.extrude import CADSequence
 from cadlib.visualize import vec2CADsolid, create_CAD
 from file_utils import ensure_dir
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--src', type=str, required=True, help="source folder")
@@ -20,22 +20,36 @@ parser.add_argument('--idx', type=int, default=0, help="export n files starting 
 parser.add_argument('--num', type=int, default=10, help="number of shapes to export. -1 exports all shapes.")
 parser.add_argument('--filter', action="store_true", help="use opencascade analyzer to filter invalid model")
 parser.add_argument('-o', '--outputs', type=str, default=None, help="save folder")
+parser.add_argument('--output_form', type=str, default="step", choices=["step", "ply"], help="output file format")
 args = parser.parse_args()
 
 src_dir = args.src
 print(src_dir)
-out_paths = sorted(glob.glob(os.path.join(src_dir, "*.{}".format(args.form))))
+
+out_paths = sorted(glob.glob(os.path.join(src_dir, "**", f"*.{args.form}"), recursive=True))
+
 if args.num != -1:
     out_paths = out_paths[args.idx:args.idx+args.num]
-save_dir = args.src + "_step" if args.outputs is None else args.outputs
+
+suffix = args.output_form
+
+save_dir = args.src + f"_{suffix}" if args.outputs is None else args.outputs
 ensure_dir(save_dir)
 
 for path in out_paths:
     print(path)
+
+    rel_path = os.path.relpath(path, src_dir)
+    save_path = os.path.join(save_dir, os.path.splitext(rel_path)[0] + f".{suffix}")
+
+    if os.path.exists(save_path):
+        print(f"{save_path} already exists. Skipping.")
+        continue
+
     try:
         if args.form == "h5":
             with h5py.File(path, 'r') as fp:
-                out_vec = fp["out_vec"][:].astype(np.float)
+                out_vec = fp["out_vec"][:].astype(np.float32)
                 out_shape = vec2CADsolid(out_vec)
         else:
             with open(path, 'r') as fp:
@@ -43,18 +57,18 @@ for path in out_paths:
             cad_seq = CADSequence.from_dict(data)
             cad_seq.normalize()
             out_shape = create_CAD(cad_seq)
-
     except Exception as e:
-        print("load and create failed.")
+        print("load and create failed.", e)
         continue
-    
+
     if args.filter:
         analyzer = BRepCheck_Analyzer(out_shape)
         if not analyzer.IsValid():
             print("detect invalid.")
             continue
-    
-    name = path.split("/")[-1].split(".")[0]
-    save_path = os.path.join(save_dir, name + ".step")
-    write_step_file(out_shape, save_path)
 
+    ensure_dir(os.path.dirname(save_path))
+    if args.output_form == "ply":
+        write_ply_file(out_shape, save_path)
+    elif args.output_form == "step":
+        write_step_file(out_shape, save_path)
