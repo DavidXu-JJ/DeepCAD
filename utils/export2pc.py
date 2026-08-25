@@ -6,12 +6,14 @@ import sys
 
 import numpy as np
 import trimesh
+from OCC.Extend.DataExchange import write_stl_file
+from trimesh.sample import sample_surface
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 
 from cadlib.extrude import CADSequence
-from cadlib.visualize import CADsolid2pc, create_CAD
+from cadlib.visualize import create_CAD
 
 
 def point_normalize(points):
@@ -29,15 +31,95 @@ def point_normalize(points):
     return scaled_points
 
 
-def save_points(points, save_path, output_format):
-    if output_format == "npy":
-        np.save(save_path + ".npy", points)
-    elif output_format == "npz":
-        np.savez_compressed(save_path + ".npz", points=points)
-    elif output_format == "ply":
-        trimesh.PointCloud(points).export(save_path + ".ply")
-    else:
-        raise ValueError(f"unsupported output format: {output_format}")
+def sample_surface_with_normals(shape, n_points, temporary_stl_path):
+    """Sample paired surface points and face normals from an OCC shape."""
+    try:
+        write_stl_file(shape, temporary_stl_path)
+        mesh = trimesh.load(temporary_stl_path, force="mesh")
+        if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+            raise ValueError("the tessellated CAD shape does not contain a mesh")
+
+        points, face_indices = sample_surface(mesh, n_points)
+        normals = mesh.face_normals[face_indices]
+        points = np.asarray(points, dtype=np.float32)
+        normals = np.asarray(normals, dtype=np.float32)
+
+        if points.shape != (n_points, 3):
+            raise ValueError(f"unexpected sampled point shape: {points.shape}")
+        if normals.shape != points.shape:
+            raise ValueError(f"unexpected sampled normal shape: {normals.shape}")
+        if not np.all(np.isfinite(points)) or not np.all(np.isfinite(normals)):
+            raise ValueError("sampled surface contains non-finite values")
+        return points, normals
+    finally:
+        if os.path.exists(temporary_stl_path):
+            os.remove(temporary_stl_path)
+
+
+def _has_training_surface_format(output_path, output_format):
+    """Check whether an existing NumPy output contains points and normals."""
+    try:
+        if output_format == "npy":
+            array = np.load(output_path, allow_pickle=True)
+            if array.shape != () or array.dtype != object:
+                return False
+            sample = array.item()
+            if not isinstance(sample, dict):
+                return False
+            points = sample.get("points")
+            normals = sample.get("normals")
+        elif output_format == "npz":
+            with np.load(output_path) as sample:
+                if "points" not in sample or "normals" not in sample:
+                    return False
+                points = sample["points"]
+                normals = sample["normals"]
+        else:
+            return True
+    except (EOFError, OSError, ValueError):
+        return False
+
+    try:
+        return (
+            isinstance(points, np.ndarray)
+            and isinstance(normals, np.ndarray)
+            and np.issubdtype(points.dtype, np.number)
+            and np.issubdtype(normals.dtype, np.number)
+            and points.ndim == 2
+            and points.shape[1:] == (3,)
+            and normals.shape == points.shape
+            and points.shape[0] > 0
+            and np.all(np.isfinite(points))
+            and np.all(np.isfinite(normals))
+        )
+    except TypeError:
+        return False
+
+
+def save_surface(points, normals, output_path, output_format):
+    """Atomically save a sampled surface in the requested format."""
+    temporary_output_path = f"{output_path}.part.{os.getpid()}"
+    try:
+        if output_format == "npy":
+            with open(temporary_output_path, "wb") as output_file:
+                np.save(
+                    output_file,
+                    {"points": points, "normals": normals},
+                    allow_pickle=True,
+                )
+        elif output_format == "npz":
+            with open(temporary_output_path, "wb") as output_file:
+                np.savez_compressed(output_file, points=points, normals=normals)
+        elif output_format == "ply":
+            trimesh.PointCloud(points).export(
+                temporary_output_path, file_type="ply"
+            )
+        else:
+            raise ValueError(f"unsupported output format: {output_format}")
+        os.replace(temporary_output_path, output_path)
+    finally:
+        if os.path.exists(temporary_output_path):
+            os.remove(temporary_output_path)
 
 
 def process_one(task):
@@ -45,8 +127,9 @@ def process_one(task):
     relative_id = os.path.splitext(os.path.relpath(json_path, raw_data))[0]
     save_path = os.path.join(save_root, relative_id)
     output_path = save_path + f".{output_format}"
+    output_exists = os.path.exists(output_path)
 
-    if os.path.exists(output_path):
+    if output_exists and _has_training_surface_format(output_path, output_format):
         return "skipped", relative_id, None
 
     try:
@@ -56,16 +139,22 @@ def process_one(task):
         cad_seq.normalize()
         shape = create_CAD(cad_seq)
 
-        # CADsolid2pc uses this name for an intermediate STL file. Including
-        # the PID prevents workers from colliding on the same temporary path.
-        temp_name = f"{os.path.basename(relative_id)}_{os.getpid()}"
-        points = CADsolid2pc(shape, n_points, temp_name)
+        temporary_stl_dir = os.path.join(save_root, ".export2pc_tmp")
+        os.makedirs(temporary_stl_dir, exist_ok=True)
+        temporary_stl_path = os.path.join(
+            temporary_stl_dir,
+            f"{os.path.basename(relative_id)}_{os.getpid()}.stl",
+        )
+        points, normals = sample_surface_with_normals(
+            shape, n_points, temporary_stl_path
+        )
         if normalize:
             points = point_normalize(points)
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        save_points(points, save_path, output_format)
-        return "exported", relative_id, None
+        save_surface(points, normals, output_path, output_format)
+        status = "repaired" if output_exists else "exported"
+        return status, relative_id, None
     except Exception as error:
         return "failed", relative_id, f"{type(error).__name__}: {error}"
 
@@ -160,7 +249,7 @@ def main():
         )
         for path in input_paths
     )
-    counts = {"exported": 0, "skipped": 0, "failed": 0}
+    counts = {"exported": 0, "repaired": 0, "skipped": 0, "failed": 0}
     total = len(input_paths)
     print(
         f"Sampling {total} CAD file(s) from {raw_data} into {save_root} "
@@ -180,7 +269,8 @@ def main():
             if completed % 100 == 0 or completed == total:
                 print(
                     f"[{completed}/{total}] exported={counts['exported']} "
-                    f"skipped={counts['skipped']} failed={counts['failed']}",
+                    f"repaired={counts['repaired']} skipped={counts['skipped']} "
+                    f"failed={counts['failed']}",
                     flush=True,
                 )
 
@@ -189,3 +279,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
